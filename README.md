@@ -1,172 +1,185 @@
-# 在 12 GB 消费级显卡上部署 176B MoE 模型作为运维脚本子代理：一次测试驱动的实践报告
+# Deploying a 176B Mixture-of-Experts Model on a 12 GB Consumer GPU as a Maintenance-Script Sub-Agent: A Test-Driven Field Study
 
-**Deploying a 176B MoE Model on a 12 GB Consumer GPU as a Maintenance-Script Sub-Agent: A Test-Driven Field Report**
-
-> 作者：yifeifelix（部署操作与决策）、Claude（总指挥与审查，子代理负责具体执行）
-> 时间：2026-10-07 至 2026-10-08
-> 硬件：RTX 4070 SUPER 12 GB / Ryzen 5 5600X / 64 GB DDR4 / Windows 11
-> 软件：Strata v0.1.40.3 + Swift-1.5 Qwen3.8-Flash-Next IQ3_XXS
-> 脱敏说明：用户名、主机名、MAC 地址、API key 已移除；内网地址写作 `<PC_IP>`、`<MAC_IP>`。
+**Author:** yifeifelix (deployment, operation and decisions), with Claude acting as orchestrator and reviewer; execution was delegated to sub-agents.
+**Period of study:** 7–8 October 2026
+**Platform:** NVIDIA RTX 4070 SUPER (12 GB), AMD Ryzen 5 5600X, 64 GB DDR4, Windows 11
+**Software:** Strata v0.1.40.3; Swift-1.5 Qwen3.8-Flash-Next, IQ3_XXS quantisation
+**Anonymisation:** user names, host names, MAC addresses and API keys have been removed. Private network addresses are written as `<PC_IP>` and `<MAC_IP>`.
 
 ---
 
-## 摘要
+## Abstract
 
-本文记录了一次完整的本地大模型部署实践。我们把 Qwen3.8-Flash-Next（176B 总参数、约 6B 激活参数的 MoE 模型）部署在一台只有 12 GB 显存、64 GB 内存的普通 Windows 台式机上，作为"子代理"专门编写 PowerShell 和 bash 运维脚本，同时让局域网内的 Mac 通过 OpenAI 兼容接口调用它。部署分 5 个阶段：准备、安装与首次启动、局域网开放与自启、Mac 接入、能力验收。整个过程采用严格的测试驱动方法：每一步先写验收测试并确认失败，再动手实施，测试全部通过后才进入下一步。这些步骤由 Claude 担任总指挥、分派给子代理执行；遇到重大问题时停下来，由人做决定。
+This report documents an end-to-end deployment of a large language model on commodity hardware. We installed Qwen3.8-Flash-Next, a Mixture-of-Experts (MoE) model with about 176 billion parameters in total and about 6 billion active per token, on an ordinary Windows desktop with 12 GB of graphics memory and 64 GB of system memory. The aim was to use it as a *sub-agent* that writes PowerShell and bash maintenance scripts. A laptop on the same local network was to reach it through an OpenAI-compatible interface.
 
-部署本身是成功的。服务开机自启、带 API key 鉴权、只对局域网开放、带健康检查和自愈。实测 decode 速度为 **52.7 tok/s**，高于预期的 25–40 tok/s。所有阶段的验收测试都通过了，其中包括真实重启后的验证（10/10）。但能力验收**没有达到预设标准**：10 道运维脚本考题满分 20 分，通过线 14 分，实际得分 **11/20**（关闭思考时的最好成绩）。我们把思考模式、低强度思考、领域陷阱清单这几种改进手段逐一做了对照实验：开启思考（模板默认最高档 xhigh）时模型陷入推理循环，得分为 0；低强度思考和陷阱清单都没有带来可测量的提升。
+The deployment ran in five stages: preparation, installation and first start, network exposure with automatic start-up, client integration, and capability acceptance. It followed a strict test-driven discipline. For every step we first wrote acceptance tests and observed them fail. We then implemented the step and advanced only once the tests passed. An orchestrating model planned the work and reviewed every result. Sub-agents executed individual tasks. A human took every decision that involved a material problem or a privileged change.
 
-全文对部署中遇到的 11 类问题逐一分析了现象、诊断方法、根本原因、修复办法和可以迁移的经验。其中有三个问题最有价值：一是显存预留不足导致 `cublasCreate` 失败；二是 Strata 聊天模板默认把思考档位设为 xhigh，导致推理死循环；三是测试脚本自身的缺陷造成误报。最后，我们根据实测数据把本地模型重新定位为"脚本初稿生成器"，用"静态检查 → 危险操作检查 → 强模型审查 → 沙盒试跑"这四道闸门来保证质量，并给出了后续的调整方案。
+**The engineering outcome was successful.** The service starts automatically, authenticates callers, is reachable only from the local subnet, and is supervised by a health check with self-healing. It reached a decode rate of **52.7 tokens per second**, against a prior estimate of 25–40. Every stage passed its acceptance suite, including a verification after a real reboot (10/10).
 
-**关键词**：本地大模型；MoE 专家卸载；Strata；Qwen3.8-Flash-Next；测试驱动部署；子代理；运维自动化；PowerShell
+**The capability outcome fell short of the pre-registered threshold.** On a ten-item script-writing examination the best score was **11 out of 20**, against a pass mark of 14. We compared four configurations in controlled runs: reasoning disabled, reasoning enabled at the template's default effort, reasoning at low effort, and reasoning disabled with a domain-specific pitfall checklist. With reasoning enabled at the default effort (`xhigh`), the model entered reasoning loops and produced no answers. Neither low-effort reasoning nor the checklist gave a measurable improvement.
 
----
+We analyse eleven classes of problem. For each we give the symptom, the diagnostic procedure, the root cause, the remedy and the transferable lesson. Three are the most instructive: a graphics-memory reserve that was too small and caused `cublasCreate` to fail; a chat template whose default reasoning effort produces non-terminating reasoning; and defects in the test code itself that produced false failures. On the evidence collected, we reposition the local model as a **first-draft generator** placed behind four quality gates, and we set out a staged plan for further work.
 
-## 1 引言
-
-### 1.1 动机
-
-日常的设备维护包括磁盘巡检、备份、计划任务、日志整理、缓存统计等，大量工作就是编写小脚本。这类任务边界清楚、结果容易验证，看起来很适合交给本地模型去做。这样有三个好处：节省云端大模型的调用开销；数据不出局域网；随时可以调用。
-
-2026 年 9 月下旬，社区出现了 Strata 引擎。它把 MoE 模型的专家权重放在系统内存里，让 GPU 只充当专家缓存。这样一来，176B 的 Qwen3.8-Flash-Next 第一次能在单张 12–24 GB 消费级显卡上跑到可用的速度：社区报告中 3060 12G 约 32 tok/s，3090 24G 超过 60 tok/s。这让"用一台普通台式机当局域网模型服务器"变得可行。
-
-### 1.2 目标
-
-1. 把 PC 变成局域网内的推理服务器，提供 OpenAI 兼容接口，带鉴权，只对内网开放，开机自启，能自愈。
-2. 让局域网内的 Mac 能通过一个命令行工具 `askl` 把脚本任务交给 PC。
-3. 用一套 10 道题的运维脚本考题，量化评估模型写脚本的能力，预设通过线为 14/20。
-4. 全过程采用测试驱动：没有通过测试，就不进入下一步。
-
-### 1.3 本文贡献
-
-- 一份在 12 GB 显卡 + 64 GB 内存上部署 Strata 的完整、可复现记录，包括真实踩过的坑和修复方法。
-- 一套面向运维脚本场景的小型能力评测方法，以及四种配置（关闭思考、xhigh 思考、低强度思考、陷阱清单）的对照数据。
-- 一个按"故障现象 → 诊断 → 根因 → 修复 → 经验"组织的问题分析章节。
-- 一个基于实测数据、而不是基于期望的定位调整方案。
+**Keywords:** local large language models; Mixture-of-Experts offloading; Strata; Qwen3.8-Flash-Next; test-driven deployment; sub-agents; systems administration; PowerShell
 
 ---
 
-## 2 背景
+## 1 Introduction
 
-### 2.1 Strata 与 MoE 专家卸载
+### 1.1 Motivation
 
-MoE（Mixture of Experts，混合专家）模型每生成一个 token，只激活少数几个"专家"子网络。Qwen3.8-Flash-Next 总参数 176B，但每个 token 只激活约 6B。Strata 利用了这个稀疏性：
+Routine maintenance of personal computing equipment involves a steady stream of small scripting tasks: disk inspection, backups, scheduled tasks, log housekeeping and cache accounting. These tasks are well bounded and their outcomes are easy to verify, so in principle they are well suited to a local language model. Delegating them locally would avoid the recurring cost of hosted models, keep data within the local network, and make help available on demand.
 
-- **权重主体放在系统内存里**（我们的配置约占 40 GiB）。
-- **GPU 只做两件事**：一是缓存最常被路由到的专家（专家缓存，按路由频率预先填充）；二是计算注意力层等稠密部分。
-- **没命中缓存的专家**，要么从内存经 PCIe 搬到 GPU 上计算，要么由 CPU 线程池直接计算。
-- **MTP（Multi-Token Prediction）投机解码**：先用一个轻量草稿头一次猜出多个 token，再由主模型验证。猜中率高时，速度可以成倍提升。
+In late September 2026 the community released the Strata inference engine. Strata keeps the expert weights of an MoE model in system memory and uses the GPU only as a cache for the experts that are used most often. For the first time, this made the 176B Qwen3.8-Flash-Next usable on a single 12–24 GB consumer GPU. Community reports cite roughly 32 tokens per second on an RTX 3060 (12 GB) and more than 60 on an RTX 3090 (24 GB). A desktop machine could therefore plausibly serve as a local model server.
 
-这种设计的代价是：**引擎是单流的**，一次只能处理一个请求，多个请求按先进先出排队。社区实测，并发 N 路请求时总吞吐基本不变，每一路的速度变成单路的 1/N。
+### 1.2 Objectives
 
-### 2.2 量化档位
+1. Turn the desktop into a local-network inference server with an OpenAI-compatible interface, authentication, subnet-only exposure, automatic start-up and self-healing.
+2. Let a laptop on the same network delegate scripting tasks through a command-line client, `askl`.
+3. Measure the model's ability to write scripts on a ten-item examination with a pass mark of 14/20, set in advance.
+4. Advance no stage without a passing acceptance test.
 
-Strata 支持多个量化档位。下表是社区给出的"内存 + 显存"需求，以及安装程序显示的实际下载体积：
+### 1.3 Contributions
 
-| 量化 | 内存 + 显存需求 | 下载体积 | 质量（社区描述） |
+- A complete, reproducible record of deploying Strata on a 12 GB GPU with 64 GB of system memory, including the faults met and how they were fixed.
+- A small evaluation method for the generation of maintenance scripts, with comparative data for four reasoning configurations.
+- A problem analysis structured as *symptom → diagnosis → root cause → remedy → lesson*.
+- A repositioning of the model's role that rests on measurement rather than expectation.
+
+---
+
+## 2 Background
+
+### 2.1 Strata and MoE expert offloading
+
+A Mixture-of-Experts model activates only a few expert sub-networks for each generated token. Qwen3.8-Flash-Next has 176B parameters in total but activates about 6B per token. Strata exploits this sparsity as follows:
+
+- The **bulk of the weights stays in system memory**. In our configuration this is about 40 GiB.
+- The **GPU** holds an *expert cache*, pre-filled by routing frequency, and computes the dense components such as attention.
+- **Experts missing from the cache** are either streamed to the GPU over PCIe or computed by a pool of CPU threads.
+- **Multi-Token Prediction (MTP)** speculative decoding uses a lightweight draft head to propose several tokens, which the main model then verifies. When most proposals are accepted, throughput rises substantially.
+
+The price of this design is that the engine is **single-stream**. It serves one request at a time and queues the others in first-in, first-out order. Community measurements show that with N concurrent clients the aggregate throughput stays roughly constant, so each client receives about 1/N of the single-stream rate.
+
+### 2.2 Quantisation tiers
+
+| Tier | Memory + graphics memory required | Download size | Quality (community description) |
 | --- | --- | --- | --- |
-| Q2_0 | 37.6 GB | 66.4 GB | 好 |
-| IQ2_XS | 39.2 GB | 68.0 GB | 更好（官方推荐） |
-| IQ3_XXS | 47.0 GB | 75.8 GB | 很好，接近 Q4 |
-| IQ3_S | 54.8 GB | 83.6 GB | 最好 |
+| Q2_0 | 37.6 GB | 66.4 GB | good |
+| IQ2_XS | 39.2 GB | 68.0 GB | better (officially recommended) |
+| IQ3_XXS | 47.0 GB | 75.8 GB | very good, close to Q4 |
+| IQ3_S | 54.8 GB | 83.6 GB | best |
 
-我们选了 IQ3_XXS：写脚本更看重质量，而 64 + 12 = 76 GB 能放得下。
+We chose IQ3_XXS. Script generation favours quality, and 64 + 12 = 76 GB is enough to hold this tier.
 
-### 2.3 社区经验（部署前已知）
+### 2.3 Prior community knowledge
 
-部署前，我们从一个本地整理的社区知识库（约 780 篇论坛帖摘录，按主题归纳成 23 篇 Runbook）里提取了相关经验：
+Before deployment we consulted a curated local corpus: about 780 forum threads, distilled into 23 thematic runbooks. The following points were relevant:
 
-- 内存少于 96 GB 时，Strata 会自动进入 low-RAM 档，prefill 慢 17–42%。
-- 默认的 MTP window 会在 32K 上下文处造成 decode 速度断崖；`--mtp-window 65536` 可以修复（这个数据来自 AMD 7900XTX）。
-- v0.1.38 之前没有 Host/CORS 校验。没设 API key 时，恶意网页可能跨站调用本地服务。
-- 升级会覆盖配置文件，必须先备份。
-- 本地模型适合做"单任务子代理"，并且要给它能验证的通过标准。给它一个具体的报错，它能修好；一次给多个问题，它会陷入循环（社区帖 #2017）。
+- Below 96 GB of system memory, Strata switches to a *low-RAM* tier, and prompt processing slows by an estimated 17–42%.
+- The default MTP window causes a fall in decode speed at 32K tokens of context. Setting `--mtp-window 65536` reportedly removes it; the evidence came from AMD hardware.
+- Versions earlier than v0.1.38 lack Host and Origin validation. Without an API key, a malicious web page could therefore invoke the local service across sites.
+- Upgrades overwrite configuration files, so those files must be backed up first.
+- Local models work best as single-task sub-agents with verifiable pass criteria. Given one concrete error, they tend to repair it. Given several problems at once, they tend to loop.
 
-后文会看到，这些经验有的直接起了作用，有的因为版本漂移已经过时。
+As later sections show, some of this guidance proved valuable and some had been overtaken by version drift.
 
 ---
 
-## 3 系统设计
+## 3 System Design
 
-### 3.1 总体架构
+### 3.1 Architecture
 
 ```
-┌──────────── Mac（调用方） ────────────┐        ┌────────────── PC（推理服务器） ──────────────┐
-│ Claude Code（主控，审查）              │        │ 计划任务 Strata-Server（登录触发，最高权限）    │
-│   └─ askl（bash）                      │  HTTP  │   └─ start-strata.ps1（清理残留进程 + 循环拉起）│
-│       ├─ key 从钥匙串读取              │ ─────▶ │       └─ serve/server.py :8080（OpenAI 兼容）  │
-│       ├─ /status 查忙闲，排队          │  LAN   │           └─ strata.exe 引擎                    │
-│       └─ 关闭思考 + 陷阱清单           │        │ 计划任务 Strata-HealthCheck（每 10 分钟）       │
-└────────────────────────────────────────┘        │ 防火墙：仅 Private + LocalSubnet 放行 8080      │
-                                                  └─────────────────────────────────────────────────┘
+┌────────── Laptop (client) ───────────┐        ┌────────────── Desktop (inference server) ──────────────┐
+│ Claude Code (orchestration, review)  │        │ Scheduled task Strata-Server (at logon, highest level) │
+│   └─ askl (bash)                     │  HTTP  │   └─ start-strata.ps1 (kill stale processes; respawn)  │
+│       ├─ key read from Keychain      │ ─────▶ │       └─ serve/server.py :8080 (OpenAI-compatible)     │
+│       ├─ queues on /status busy      │  LAN   │           └─ strata.exe engine                         │
+│       └─ reasoning off + checklist   │        │ Scheduled task Strata-HealthCheck (every 10 minutes)   │
+└──────────────────────────────────────┘        │ Firewall: port 8080 open to Private + LocalSubnet only │
+                                                └────────────────────────────────────────────────────────┘
 ```
 
-**分工原则**：强模型（Claude）负责规划、审查和最终把关；本地模型只接定义清楚的单个任务，产出的脚本必须经过审查才能执行。
+**Division of labour.** A strong model plans, reviews and gives final approval. The local model receives single, well-defined tasks. Nothing it produces runs before review.
 
-### 3.2 硬件与存储分工
+### 3.2 Hardware and storage allocation
 
-| 部件 | 配置 | 说明 |
+| Component | Specification | Note |
 | --- | --- | --- |
-| GPU | RTX 4070 SUPER 12 GB，驱动 617.42 | 同时驱动桌面显示 |
-| CPU | Ryzen 5 5600X（6 核，AVX2） | — |
-| 内存 | 64 GB | 低于 96 GB |
-| 磁盘 | C: Crucial P3 2 TB（PCIe 3.0 NVMe）；E: Crucial P3 Plus 2 TB（PCIe 4.0 NVMe）；D: 4 TB 机械盘 | — |
+| GPU | RTX 4070 SUPER, 12 GB, driver 617.42 | also drives the desktop display |
+| CPU | Ryzen 5 5600X (6 cores, AVX2) | — |
+| System memory | 64 GB | below the 96 GB low-RAM threshold |
+| Storage | C: Crucial P3 2 TB (NVMe, PCIe 3.0); E: Crucial P3 Plus 2 TB (NVMe, PCIe 4.0); D: 4 TB hard disk | — |
 
-存储方案经过两次调整，值得记下来：
-1. 初稿把所有东西装在 `D:`。后来核对硬件时发现 **D: 是机械盘**。按 low-RAM 档的工作方式，专家权重可能要在运行时从盘上读，放在机械盘上会慢到不可用。
-2. 改到最快的 E:（PCIe 4.0）。
-3. 用户考虑到容量和管理方便，最终决定放 C:（PCIe 3.0，剩余 671 GB）。代价是冷启动和 prefill 可能略慢，并且要和系统共用 I/O。实测加载速度为 1.92 GiB/s，可以接受。
+The choice of storage changed twice, and the history is worth recording.
 
-**教训**：先用 `Get-PhysicalDisk` 核对盘符对应的真实型号和介质类型，再决定安装位置。不要凭印象。
+1. The first draft placed everything on `D:`. Checking the hardware showed that **D: is a mechanical hard disk**. Under the low-RAM tier, expert weights may have to be read from storage at run time, which would make a hard disk unusable.
+2. The installation target moved to the fastest drive (E:, PCIe 4.0).
+3. For capacity and ease of management, the owner finally chose C: (PCIe 3.0, 671 GB free). This accepted slightly slower cold starts and shared I/O with the operating system. The measured load rate was 1.92 GiB/s, which was acceptable.
 
-### 3.3 测试驱动的部署方法
+**Lesson.** Check the physical model and media type behind each drive letter with `Get-PhysicalDisk` before choosing an installation path. Do not rely on recollection.
 
-每个阶段都遵循同一个循环：
+### 3.3 Test-driven deployment
 
-1. **先写验收测试**（Pester 6；Mac 端用 bats），描述"完成"是什么样子。
-2. **运行测试，确认失败**（red），保存输出作为证据。
-3. **实施。**
-4. **重新运行，直到全部通过**（green），保存输出。
-5. **测试没有全部通过，就不进入下一阶段。**
+Every stage followed the same cycle:
 
-这样做有两个具体好处：
-- **测试就是验收标准的精确定义。** 比如"对局域网开放"被拆成了可以检查的条目：不带 key 返回 401、带 key 返回 200、局域网 IP 能访问、防火墙规则只放行 Private + LocalSubnet、网络类型是 Private。
-- **测试能发现"看似成功"的失败。** 比如用户以为管理员脚本已经执行了，测试显示那其实只是 `-WhatIf` 预演（见 5.6）。
+1. **Write the acceptance tests first**, using Pester 6 on Windows and bats on macOS, so that they state what "done" means.
+2. **Run them and confirm that they fail** (red), and keep the output as evidence.
+3. **Implement the step.**
+4. **Run the tests again until they all pass** (green), and keep that output too.
+5. **Never advance on red.**
 
-### 3.4 指挥与执行分离
+The cycle paid off in two concrete ways.
 
-Claude 作为总指挥，把每个 PowerShell / bash 任务连同精确的验收标准一起交给子代理执行，子代理返回带证据的报告。总指挥负责：
-- 审查子代理的报告，不盲信；
-- 亲自审查要用管理员权限运行的脚本；
-- 遇到重大问题时停下来，交给人决定。
+- **Tests made acceptance criteria precise.** "Expose the service to the local network" became checkable assertions: HTTP 401 without a key; HTTP 200 with a key; the LAN address answers; the firewall rule is limited to the Private profile and the local subnet; the network profile is Private.
+- **Tests exposed apparent successes that were in fact failures.** In one case a privileged script that the operator believed had run had only been previewed with `-WhatIf` (§5.6).
 
-需要管理员权限的系统改动（防火墙、网络类型、电源、计划任务、Defender 排除），一律写成**支持 `-WhatIf`、可以重复运行的脚本**，由用户本人在管理员终端里执行，执行后再用测试验证。
+### 3.4 Separating orchestration from execution
 
-### 3.5 安全模型
+The orchestrator delegated each PowerShell or bash task to a sub-agent, together with exact acceptance criteria, and received an evidence-bearing report in return. The orchestrator reviewed every report and every privileged script itself. When a material problem arose, it stopped and referred the decision to the human.
 
-- 服务监听 `0.0.0.0:8080`，但防火墙只放行 Private 网络里的 LocalSubnet，路由器不做端口转发。
-- API key 用加密级随机数生成（`RandomNumberGenerator`，24 字节，转成十六进制）。key 文件的访问权限只保留用户本人、SYSTEM 和 Administrators。Mac 端的 key 存在钥匙串里，经 `-H @<(...)` 传给 curl，不出现在进程参数里。
-- 本地模型生成的脚本**一律不直接执行**，必须先经过四道闸门（见第 8 节）。
+Every privileged change was written as an **idempotent script that supports `-WhatIf`**. The operator ran these scripts in an elevated terminal, and tests then verified the outcome. The changes covered the firewall, the network profile, power settings, scheduled tasks and the antivirus exclusion.
+
+### 3.5 Security model
+
+- **Network exposure.** The service listens on `0.0.0.0:8080`. The firewall admits only the local subnet on the Private profile, and the router forwards no ports.
+- **API key generation.** The key comes from a cryptographic random-number generator (24 bytes, hex-encoded). The access-control list on the key file is restricted to the owner, SYSTEM and Administrators.
+- **Client-side storage.** On the laptop the key is kept in the macOS Keychain. It is passed to `curl` via `-H @<(...)`, so it never appears in the process arguments.
+- **Model output.** Scripts produced by the local model are **never executed directly**. They must first pass the four gates described in §8.
 
 ---
 
-## 4 实施过程
+## 4 Implementation
 
-### 4.1 阶段 0：准备
+### 4.1 Stage 0: Preparation
 
-预检测试一共 15 项。第一次运行时 2 项失败：没有安装 PowerShell 7，Python 只有 3.11。另外还发现两个隐患：WiFi 的网络类型是 Public，当前会话不是管理员。
+The first run of the pre-flight suite exposed two failures: PowerShell 7 was absent, and only Python 3.11 was installed. It also exposed two latent risks: the Wi-Fi profile was Public, and the session was not elevated.
 
-得到用户同意后，通过 winget（`--scope user`，不需要管理员权限）安装了 PowerShell 7.6.6、Python 3.12.10（与 3.11 并存），再从 PSGallery 安装了 Pester 6.2.0 和 PSScriptAnalyzer 1.25.0。重跑测试，8 项检查全部通过。
+With the owner's consent, we installed the following:
 
-### 4.2 阶段 1：安装与首次启动
+| Component | Version | Source |
+| --- | --- | --- |
+| PowerShell | 7.6.6 | winget (`--scope user`, no elevation) |
+| Python | 3.12.10 (installed alongside 3.11) | winget (`--scope user`) |
+| Pester | 6.2.0 | PowerShell Gallery |
+| PSScriptAnalyzer | 1.25.0 | PowerShell Gallery |
 
-**1a 克隆与审计。** 先只克隆仓库，不运行任何东西，对安装脚本做静态审计：读出所有交互提示和对应的非交互参数、所有下载来源、所有写入路径、所有需要管理员权限的操作，以及可疑代码。审计结论：
-- 主流程不需要管理员权限；
-- 引擎二进制有 SHA-256 校验（但校验值和二进制来自同一个 GitHub 仓库，独立性有限）；
-- 没有发现远程遥测；
-- 有两个与原计划不符的地方：启动脚本叫 `START-HERE.bat`（中间是短横线），`--no-low-ram` 参数不存在。
+The suite then passed (8/8).
 
-**1b 安装。** 先手动用 `py -3.12` 创建 venv，固定 Python 版本（安装脚本会优先选 `py -3`，可能选到更新的版本），然后非交互安装：
+### 4.2 Stage 1: Installation and first start
+
+**Stage 1a: clone and audit.** The repository was cloned but nothing in it was run. A static audit of the installer recorded:
+
+- every interactive prompt and its non-interactive flag;
+- every download host;
+- every path written;
+- every operation needing elevation;
+- any suspicious construct.
+
+The main installation path needed no elevation, and no remote telemetry was found. Engine binaries are checked with SHA-256, although the hashes come from the same repository as the binaries, so the check is of limited independence. Two discrepancies with our plan came to light: the launcher is named `START-HERE.bat` (with a hyphen), and the `--no-low-ram` flag does not exist.
+
+**Stage 1b: installation.** We created the virtual environment by hand with `py -3.12` to pin the interpreter, because the installer prefers `py -3`, which can resolve to a newer version. We then ran the installer non-interactively:
 
 ```bat
 START-HERE.bat --yes --no-start --no-browser --family swift --model IQ3_XXS ^
@@ -174,83 +187,83 @@ START-HERE.bat --yes --no-start --no-browser --family swift --model IQ3_XXS ^
   --data-dir C:\AI\Strata-data
 ```
 
-下载约 82 GB（模型 76 GB，加 MTP 草稿层、引擎和 CUDA 运行库）。安装程序自动选择了"KV 流式到内存"（KV cache 放在内存，占 1.8 GB），把显存让给专家缓存。阶段 1b 测试 20/20 通过。
+About 82 GB was downloaded: the 76 GB model, plus the MTP draft layer, the engine and the CUDA runtime libraries. The installer chose to stream the KV cache to system memory (1.8 GB), which leaves graphics memory free for the expert cache. Stage 1b passed (20/20).
 
-**1c 首次启动。** 第一次启动失败，原因是显存不足（详见 5.4）。把显存预留从 1500 MiB 提高到 3072 MiB 之后，测试 6/6 通过：
+**Stage 1c: first start.** The first start failed for lack of graphics memory (§5.4). After the reserve was raised from 1500 MiB to 3072 MiB, the suite passed (6/6):
 
-| 指标 | 实测 |
+| Metric | Measured |
 | --- | --- |
-| decode（引擎计时） | 52.7 tok/s |
-| decode（端到端，含 HTTP 和 prefill） | 40.6 tok/s |
-| MTP 草稿接受率 | 82%（65/79） |
-| KV 读取命中显存 | 98.6% |
-| 专家缓存命中率 | 预热中，18.8% → 45.7% |
+| Decode rate (engine timing) | 52.7 tok/s |
+| Decode rate (end-to-end, incl. HTTP and prefill) | 40.6 tok/s |
+| MTP draft acceptance | 82% (65/79) |
+| KV reads served from graphics memory | 98.6% |
+| Expert-cache hit rate | 18.8% → 45.7% (still warming) |
 
-### 4.3 阶段 2：局域网开放与自启
+### 4.3 Stage 2: Network exposure and automatic start-up
 
-我们这边完成了：
-- 生成 key；
-- 修改配置（`host 0.0.0.0`、`api_key`、`model_name local-flash-next`）；
-- 编写自愈启动脚本（每次启动前清理残留进程，进程退出 30 秒后自动拉起）；
-- 编写管理员脚本（网络类型改为 Private、添加防火墙规则、电源设置、注册计划任务、可选的 Defender 排除）。
+The orchestrator's side produced four items:
 
-用户运行管理员脚本后，测试 19/19 通过。
+- the API key;
+- the service configuration (`host 0.0.0.0`, `api_key`, and `model_name local-flash-next`);
+- a self-healing launcher, which removes stale processes before each start and respawns the server 30 seconds after any exit;
+- a privileged script for the network profile, firewall rule, power settings, scheduled task and optional antivirus exclusion.
 
-**重启验证。** 测试先写好，重启前运行，有 4 项因为"还没重启"而失败，这符合预期。真实重启后：开机 40 秒，计划任务就把服务拉起来了，模型加载完成；第一次运行有 2 项失败，都是测试本身的缺陷（见 5.7），修复后 10/10 通过。
+Once the operator had run the privileged script, the suite passed (19/19).
 
-### 4.4 阶段 3：Mac 接入
+**Reboot verification.** We wrote the reboot suite before rebooting. Its four post-boot assertions failed beforehand, as expected. After a real reboot, the scheduled task had started the service within 40 seconds of boot, and the model loaded. Two assertions failed on the first run, both because of defects in the tests themselves (§5.7). After correction the suite passed (10/10).
 
-我们把 Mac 端的工作写成一份独立的任务书，交给 Mac 上的 Claude Code 执行，同样遵循测试驱动。
-- 存 key 这一步由用户本人在终端里完成，Claude 不接触 key。
-- bats 测试 10/10 通过，覆盖连通性、401/200、代码块输出、管道输入、离线时返回退出码 2、服务忙时返回退出码 4、key 不泄露。
-- Mac 端遇到一个 bash 3.2 不支持 `${arr[-1]}` 负下标的问题，属于测试脚本缺陷，已修复。
+### 4.4 Stage 3: Client integration
 
-### 4.5 运维增强：忙闲感知与健康检查
+We wrote the laptop's work as a self-contained brief and gave it to a separate Claude Code instance on the laptop, under the same test-driven rules. The operator, not the model, stored the key in the Keychain.
 
-能力验收期间发现，单流引擎处理一个长请求时会被独占几分钟，于是加入两项改进：
+The bats suite passed (10/10). It covered connectivity, the 401/200 behaviour, fenced-code output, input from a pipe, exit code 2 when the server is offline, exit code 4 when the server is busy, and absence of key leakage. A defect in the test itself, a negative array index that bash 3.2 does not support, was found and corrected.
 
-1. **`askl` 发请求前先查 `/status` 的 `busy` 字段**，服务在忙就排队等待（默认最多 600 秒）。超时返回退出码 4，不让请求堆积。
-2. **健康检查 `strata-health.ps1`** 注册为计划任务，每 10 分钟运行一次。设计要点见第 7 节，验收测试 9/9 通过；手动触发一次后，日志写入 `healthy`，服务没有受到影响。
+### 4.5 Operational hardening: busy-aware queuing and health supervision
+
+During the evaluation it became clear that a single long request can monopolise the single-stream engine for minutes. Two measures were therefore added.
+
+1. **`askl` checks `/status` before sending.** If the `busy` flag is set, it waits and re-checks, for at most 600 seconds by default. It then gives up with exit code 4 rather than letting requests accumulate.
+2. **A health check, `strata-health.ps1`,** runs every ten minutes as a scheduled task. Its design is described in §7. Its acceptance suite passed (9/9). A manual trigger logged `healthy` and left the service undisturbed.
 
 ---
 
-## 5 问题分析
+## 5 Problem Analysis
 
-本节按"现象 → 诊断 → 根因 → 修复 → 经验"的格式，逐一分析部署中遇到的问题。
+Each problem is set out as *symptom → diagnosis → root cause → remedy → lesson*.
 
-### 5.1 工具链缺失与 PATH 异常
+### 5.1 Missing toolchain and a damaged PATH
 
-- **现象**：预检测试报告 `pwsh` 不存在；装好之后，`Get-Command pwsh` 仍然找不到，`winget` 也找不到。
-- **诊断**：检查用户 PATH 的注册表值，发现缺少 `%LOCALAPPDATA%\Microsoft\WindowsApps`。用 winget 装的 PowerShell 7 是 MSIX 包，只在这个目录里放一个"应用执行别名"。
-- **根因**：这台机器的用户 PATH 被改过，丢了 WindowsApps 这一项。
-- **修复**：不改 PATH，所有调用都使用完整路径 `...\WindowsApps\pwsh.exe`，包括计划任务。最后用重启测试验证：计划任务能通过这个别名正常启动 pwsh。
-- **经验**：在计划任务里调用 MSIX 别名路径是可行的，但必须用真实重启来验证，不能假设它一定行。
+- **Symptom.** `pwsh` was reported missing. After installation, neither `pwsh` nor `winget` could be resolved.
+- **Diagnosis.** The user-level `PATH` in the registry lacked `%LOCALAPPDATA%\Microsoft\WindowsApps`. That is the only place where an MSIX-packaged PowerShell exposes its execution alias.
+- **Root cause.** The user `PATH` on this machine had been edited at some earlier point, and the WindowsApps entry had been lost.
+- **Remedy.** We left `PATH` untouched and called every tool by its full path, including from the scheduled task. A real reboot confirmed that Task Scheduler can start PowerShell through the alias.
+- **Lesson.** Launching an MSIX alias from Task Scheduler works, but it should be confirmed with a genuine reboot rather than assumed.
 
-### 5.2 文档与实际版本不一致
+### 5.2 Version drift between documentation and code
 
-- **现象**：
-  - 按文档调用 `START_HERE.bat`，提示"不是内部或外部命令"；
-  - 计划里的 `--no-low-ram` 在代码里搜不到；
-  - 第一次在后台用 `cmd /c "START-HERE.bat ..."` 启动，也报找不到文件。
-- **诊断**：子代理逐行审计源码，找到了实际的文件名、参数表（`setup.py:4515-4612`）和低内存相关选项。`cmd` 找不到文件是因为 PowerShell 的 `Set-Location` 没有带到子进程的当前目录。
-- **根因**：Strata 迭代极快，10 天内从 v0.1.28 升到了 v0.1.40。社区帖子和知识库记录的是旧版本，或者来自社区 fork（`--no-low-ram` 来自 nvfp4 fork）。
-- **修复**：一律以当前仓库的源码为准：
-  - 启动脚本用 `START-HERE.bat`；
-  - 低内存模式改用 `--low-ram auto|on|off|resident|mmap`；
-  - 用 `cmd /c "cd /d C:\AI\Strata && C:\AI\Strata\START-HERE.bat ..."` 指定完整路径。
-- **经验**：对快速迭代的项目，部署前先做一次**源码审计**。审计的花费远小于按过时文档反复试错的花费。
+- **Symptoms.**
+  - `START_HERE.bat` was "not recognised".
+  - `--no-low-ram` could not be found anywhere in the source.
+  - Launching the installer with `cmd /c` from a PowerShell session failed to find the file.
+- **Diagnosis.** A line-by-line audit of the source recovered the actual file name, the actual flag table (`setup.py:4515–4612`) and the actual low-memory options. `cmd` failed because PowerShell's `Set-Location` is not inherited by child processes as their working directory.
+- **Root cause.** Strata moved from v0.1.28 to v0.1.40 in about ten days. The forum threads and our corpus described earlier builds or a community fork; `--no-low-ram` originated in the NVFP4 fork.
+- **Remedy.** We treated the current source as authoritative:
+  - the launcher is `START-HERE.bat`;
+  - the low-memory control is `--low-ram auto|on|off|resident|mmap`;
+  - the installer is invoked as `cmd /c "cd /d <dir> && <dir>\START-HERE.bat ..."`.
+- **Lesson.** For a fast-moving project, audit the source before deploying. An audit costs far less than repeated trial and error against stale instructions.
 
-### 5.3 内存余量不足
+### 5.3 Insufficient system-memory headroom
 
-- **现象**：引擎日志警告 `the expert arena needs 39.97 GiB of RAM but 37.20 GiB is available (2.77 GiB short)`。
-- **诊断**：查看进程的内存占用和空闲内存，发现启动时浏览器等程序占了较多内存。
-- **根因**：IQ3_XXS 的专家权重常驻在内存里，需要约 40 GiB，再加上 KV 和 pack 共约 43 GB；64 GB 的机器扣掉系统和日常程序后，余量很紧。
-- **修复**：启动前关掉占内存的程序，保证空闲内存 ≥ 48 GB（第二次启动时空闲 50.9 GB）。
-- **经验**：64 GB 跑 IQ3_XXS 属于"能放下但余量紧"。长期运行时，要么接受启动前清理，要么退到 IQ2_XS，要么把 `--low-ram` 切到 mmap 模式（会降速，我们没有实测）。
+- **Symptom.** The engine warned: `the expert arena needs 39.97 GiB of RAM but 37.20 GiB is available (2.77 GiB short)`.
+- **Diagnosis.** Inspecting process working sets showed that browsers and other applications were holding a substantial share of memory at start-up.
+- **Root cause.** The resident expert arena for IQ3_XXS needs about 40 GiB, and about 43 GB with the KV cache and the pack included. That leaves little margin on a 64 GB machine.
+- **Remedy.** Close heavy applications before starting, so that at least 48 GB is free. On the second start, 50.9 GB was free.
+- **Lesson.** On 64 GB, IQ3_XXS fits, but without much room. The alternatives are a disciplined start-up routine, the IQ2_XS tier, or memory-mapped experts via `--low-ram mmap`, which is slower and which we did not measure.
 
-### 5.4 关键故障：显存预留不足导致 cuBLAS 初始化失败
+### 5.4 Critical fault: an insufficient graphics-memory reserve prevents cuBLAS initialisation
 
-- **现象**：模型加载完成，引擎报告 `session is up`，紧接着报错退出：
+- **Symptom.** The model loaded and the engine reported `session is up`. It then terminated:
 
   ```
   strata serve: the prompt path borrows 2055 CUDA0 cache slots (3.37 GiB)
@@ -258,302 +271,332 @@ START-HERE.bat --yes --no-start --no-browser --family swift --model IQ3_XXS ^
   RuntimeError: the engine exited before it was ready
   ```
 
-- **诊断过程**（按"先排除容易验证的假设"的顺序）：
-  1. **库文件缺失？** 在 venv 里找到了 `cublas64_13.dll`、`cublasLt64_13.dll` 和 `cudart64_13.dll`，配置的 `lib_dirs` 也指向了它们。驱动 617 支持 CUDA 13。**排除。**
-  2. **显存不足？** 从日志里把显存账逐项加起来：
-     - 自动计算时：12 GB 显存，可用 5.40 GiB，减去 1500 MiB 预留，应该分到 **1731** 个专家槽位；
-     - 实际却按 profile 分配了 **2286** 个槽位，占 3.75 GiB；
-     - 再加上常驻 KV 32K、MTP 草稿层 881 MiB、prefill 借用 3.37 GiB；
-     - 轮到创建 cuBLAS 句柄（它需要显存）时，显存已经用完。`CUBLAS_STATUS_NOT_INITIALIZED`（status 1）在显存分配失败时也会出现。
-  3. **有没有先例？** 在 Strata 仓库里搜索 `cublasCreate`，在一份社区 benchmark 驱动脚本里找到一条注释，大意是：不显式给足预留时，缓存会按几乎全部空闲显存来分配，之后 `cublasCreate` 分配失败；那里的做法是把预留设为 3072。
-- **根因**：专家缓存的大小按 profile 而不是按扣除预留后的实际余量来确定，留给 cuBLAS 工作区的显存不够。这张卡同时驱动桌面，桌面还要占 500–600 MiB，进一步加重了紧张。
-- **修复**：只改一个变量：`--vram-reserve-mib` 从 1500 改成 3072。改完重启服务，6/6 测试通过，运行时还剩约 2.5 GB 显存。
-- **验证假设的方式**：一次只改一个变量。我们事先列好了备选方案（`--draft-vocab en` 可以省约 215 MiB，`--kv-resident` 可以从 32768 降到 16384），但第一项就解决了问题，所以没有动其他参数。
-- **经验**：
-  1. 在 12 GB 显卡上，同时驱动桌面时，显存预留至少要 3 GB。
-  2. 看到 `cublasCreate` 失败，先把日志里的显存账逐项加一遍，往往一眼就能看出问题。
-  3. 先到项目自己的 bench 和 issue 记录里搜一遍报错字符串，往往能找到现成答案。
+- **Diagnosis.** Hypotheses were tested in order of cost, cheapest first.
+  1. *Missing libraries?* `cublas64_13.dll`, `cublasLt64_13.dll` and `cudart64_13.dll` were present in the virtual environment. The configuration's `lib_dirs` pointed at them, and driver 617 supports CUDA 13. **Rejected.**
+  2. *Graphics-memory exhaustion?* Adding up the budget from the log:
+     - automatic sizing found 5.40 GiB free and, after the 1500 MiB reserve, arrived at **1,731** cache slots;
+     - the expert profile then allocated **2,286** slots (3.75 GiB);
+     - on top of that came a 32K-token resident KV region, an 881 MiB MTP head and a further 3.37 GiB borrowed for prompt processing.
 
-### 5.5 测试误报一：系统语言导致解析失败
+     By the time the cuBLAS handle was created, which itself needs device memory, nothing was left. `CUBLAS_STATUS_NOT_INITIALIZED` (status 1) is also what cuBLAS returns when its allocation fails.
+  3. *Precedent?* Searching the Strata repository for `cublasCreate` found a comment in a community benchmark driver. It describes the same failure: without an explicit reserve, the cache sizes itself against almost all free memory and `cublasCreate` then fails to allocate. The remedy used there was a reserve of 3072 MiB.
+- **Root cause.** The expert cache was sized from the routing profile rather than from the space left after the reserve. Too little memory remained for the cuBLAS workspace. The 500–600 MiB used by the desktop display on the same card made the shortage worse.
+- **Remedy.** A single variable was changed: `--vram-reserve-mib` from 1500 to 3072. The suite passed (6/6), and about 2.5 GB of graphics memory remained free at run time.
+- **Method.** Only one variable was changed at a time. Further steps had been prepared in advance: `--draft-vocab en`, saving about 215 MiB, and a smaller `--kv-resident`. They were not needed.
+- **Lessons.**
+  1. On a 12 GB card that also drives a display, reserve at least 3 GB.
+  2. When `cublasCreate` fails, add up the memory budget from the log first; the shortfall is usually obvious.
+  3. Search the project's own benchmarks and issue history for the exact error string before experimenting.
 
-- **现象**：电源设置测试失败，提示期望匹配 `Current AC Power Setting Index: 0x00000000`。
-- **诊断**：直接运行 `powercfg /q`，发现输出是中文的"当前交流电源设置索引"。
-- **根因**：测试脚本假设命令输出是英文。
-- **修复**：正则同时匹配中英文两种写法。测试文件存为 UTF-8 with BOM，保证 Windows PowerShell 5.1 能正确读出中文。
-- **经验**：系统命令的输出会随系统语言变化。能用结构化数据（CIM、对象属性）的地方，就不要去解析文本。
+### 5.5 False failure: locale-dependent command output
 
-### 5.6 预演被误当成执行
+- **Symptom.** A power-settings assertion failed. It expected the text `Current AC Power Setting Index: 0x00000000`.
+- **Diagnosis.** Running `powercfg /q` by hand showed localised (Chinese) output.
+- **Root cause.** The test assumed English output.
+- **Remedy.** The pattern was extended to accept both the English and the localised label. The test file was saved as UTF-8 with a byte-order mark so that Windows PowerShell 5.1 decodes it correctly.
+- **Lesson.** Command output varies with the system locale. Use structured data, such as CIM classes and object properties, wherever possible instead of parsing text.
 
-- **现象**：用户回报"执行完了"，但测试显示网络类型、防火墙、计划任务、电源这 5 项都没有变化。
-- **诊断**：用户贴出的输出全是 `What if:` 开头的行，摘要里写的都是"would ..."。
-- **根因**：用户只运行了 `-WhatIf` 预演。
-- **修复**：提示用户运行不带 `-WhatIf` 的正式命令，并告诉他正确的输出应该是什么样子（"set to Private / created / registered"，而不是 "would ..."）。
-- **经验**：这正是"测试是事实来源"的价值：口头确认不可靠，要用测试结果来验证。给用户的指令里，也应该写清楚成功时的输出长什么样。
+### 5.6 Preview mistaken for execution
 
-### 5.7 测试误报二：测试代码本身的缺陷
+- **Symptom.** The operator reported the privileged script as complete. The tests nevertheless showed no change to the network profile, firewall, scheduled task or power settings.
+- **Diagnosis.** The output the operator pasted consisted entirely of `What if:` lines, and its summary read "would …".
+- **Root cause.** Only the `-WhatIf` preview had been run.
+- **Remedy.** The operator ran the command without `-WhatIf`, having been told what successful output looks like: "set to Private", "created", "registered".
+- **Lesson.** Tests, not verbal confirmations, are the source of truth. Instructions to an operator should state what successful output looks like.
 
-重启测试第一次运行时有 2 项失败，但服务实际上完全正常。逐一分析：
+### 5.7 False failures caused by defects in the tests
 
-1. **日志时间检查失败。**
-   - 根因：`$lines = Get-Content ... | Where-Object {...}` 只匹配到一行时，`$lines` 是一个字符串而不是数组，`$lines[-1]` 取到的是**最后一个字符**。
-   - 修复：用 `@(...)` 强制转成数组。
-   - 这是 PowerShell 的一个经典陷阱：管道只返回一个对象时，结果会被"拆包"成标量。
-2. **"只运行一个服务进程"检查失败**，而且出现过两次，原因不同：
-   - **重启前**：检查结果是 2 个进程。原因是 Windows 上 venv 里的 `python.exe` 只是一个启动器，它会再拉起基础解释器，两个进程的命令行完全相同。修复：只统计父进程不在匹配集合里的那个。
-   - **重启后**：检查结果是 0 个进程。原因是计划任务以最高权限运行，非管理员会话通过 CIM 读不到这些进程的 `CommandLine`，返回 null。修复：改为检查"8080 端口的监听进程恰好 1 个，并且 `strata.exe` 进程恰好 1 个"，这两项都不需要管理员权限也能读到。
-3. **Mac 端**：bash 3.2 不支持 `${lines[-1]}` 负下标。
+The first post-reboot run reported two failures although the service was demonstrably healthy.
 
-**经验**：测试失败时，先问一句"是被测对象错了，还是测试错了？"。判断方法：用另一种独立的方式验证被测对象的真实状态。比如直接 `curl /health`、查看进程树。如果确实是测试错了，就修测试，并在报告里写明修了什么、为什么修。**不能为了让测试通过就放宽标准**，修改后的断言必须仍然检查同一件事。
+1. **Log timestamp assertion.**
+   - *Cause:* `$lines = Get-Content … | Where-Object {…}` returns a scalar string, not an array, when exactly one line matches. `$lines[-1]` therefore returned the **last character** of that line, not the last line. This is a classic PowerShell pitfall: a pipeline that yields one object unwraps it.
+   - *Remedy:* force an array with `@(...)`.
+2. **"Exactly one server instance" assertion**, which failed twice for different reasons.
+   - *Before the reboot it counted two processes.* On Windows a virtual environment's `python.exe` is a launcher that spawns the base interpreter, and the two processes share the same command line. *Remedy:* count only root processes, that is, those whose parent is not in the matched set.
+   - *After the reboot it counted none.* The server had been started by a task running at the highest privilege level, and a non-elevated CIM query cannot read the `CommandLine` of such processes; it returned null. *Remedy:* assert that exactly one process listens on port 8080 and that exactly one `strata.exe` exists. Neither check needs elevation.
+3. **On the laptop**, bash 3.2 does not support the negative index `${lines[-1]}`.
 
-### 5.8 子代理执行偏差
+**Lesson.** When a test fails, ask first whether the subject or the test is at fault. Answer the question by checking the subject's real state independently, for example with `curl /health` or by inspecting the process tree. If the test is at fault, correct it and record what was changed and why. **A test must never be weakened merely to make it pass.** The revised assertion must still check the same property.
 
-- **跳过了 TDD 中"先看到失败"的步骤**：有一次加 `-Think` 开关时，子代理先改了代码再写测试，没有 red 记录。总指挥在报告中如实标注了这一点，之后在任务描述里明确要求"必须先运行测试并保存失败输出"，后续都做到了。
-- **工具调用方式错误**：`Get-ScriptBlock.ps1` 通过管道传给 `pwsh -File` 时，stdin 不会绑定到管道参数；多行文本作为 `-Text` 参数在命令行上传递也会被拆开。正确做法是 `pwsh -Command "Get-Content -Raw f | & script.ps1 -OutFile out"`。一次考题生成因此白跑了一轮修复调用，子代理发现后重新提取，并把作废的数据单独归档。
-- **经验**：给子代理的任务描述要写清楚"不允许做什么"和"必须留下哪些证据"，并且审查子代理报告里的"偏离说明"一节。
+### 5.8 Deviations by sub-agents
 
-### 5.9 安全 hook 拦截
+- **A skipped red step.** On one occasion a sub-agent changed the code before writing the tests, so no red evidence existed. The orchestrator reported this openly. Later briefs required the red output to be saved before any implementation, and that requirement was then met.
+- **A tool invoked incorrectly.** Piping text into `pwsh -File` does not bind standard input to a pipeline parameter. Multi-line text passed as a command-line argument is split. One generation round was wasted on this before the sub-agent found the cause, re-extracted the code and archived the invalid data separately. The correct form is `pwsh -Command "Get-Content -Raw f | & script.ps1 -OutFile out"`.
+- **Lesson.** A brief should state what is forbidden and what evidence must be returned, and the orchestrator should read every report's section on deviations.
 
-- **现象**：用 `Copy-Item ... -Force` 覆盖 `D:\` 根目录下的文件，被"系统路径保护"的 hook 拦截，整条命令都没有执行。
-- **诊断**：确认目标文件没有变化，没有发生部分写入。
-- **修复**：改用 `[IO.File]::Copy(src, dst, $true)` 覆盖写入。
-- **经验**：hook 拦截意味着整条命令都没有执行，要先确认状态，再换一种方式完成同样的操作。
+### 5.9 Interception by a safety hook
 
-### 5.10 模型生成的 dry-run 有副作用
+- **Symptom.** A `Copy-Item … -Force` onto a file in the root of drive `D:` was intercepted by a path-protection hook. The command did not execute at all.
+- **Diagnosis.** The target was checked and found unchanged, with no partial write.
+- **Remedy.** The file was overwritten with `[IO.File]::Copy(src, dst, $true)`.
+- **Lesson.** An intercepted command has done nothing. Verify the state, then reach the same outcome by another route.
 
-- **现象**：考题 4（robocopy 备份）生成的脚本默认以 `/L` 只列不拷的方式运行，却在 D: 上创建了 `D:\Backup\knowledge` 目录。
-- **根因**：创建目录的代码放在 `ShouldProcess` 里，但没有传 `-WhatIf` 时 `ShouldProcess` 默认返回 true，所以 dry-run 和正式运行走的是同一个分支。
-- **处理**：
-  - 那个空目录由子代理用不带递归的删除移除，并如实报告；
-  - 之后在危险操作检查里加了一条"在 D: 上建目录（不在正式运行分支里）"；
-  - 陷阱清单里加了一条"dry-run 不能有副作用"。
-  - 后来同类脚本在运行前就被检查拦下了。
-- **经验**：dry-run 的语义需要明确定义，并且要用测试检查它确实没有副作用（比如运行前后检查目标目录是否存在）。
+### 5.10 Side effects in a model-generated dry run
 
-### 5.11 思考模式陷入推理循环
+- **Symptom.** The script generated for examination item 4 (a robocopy backup) ran in list-only mode (`/L`) by default, yet it created the directory `D:\Backup\knowledge`.
+- **Root cause.** The directory creation sat inside a `ShouldProcess` branch. Without `-WhatIf`, `ShouldProcess` returns true, so the dry run and the real run followed the same path.
+- **Remedy.**
+  - The empty directory was removed non-recursively, and the removal was reported.
+  - The danger screen gained a rule against directory creation on `D:` outside the real-run branch.
+  - The pitfall checklist gained a rule that a dry run must have no side effects.
+  - A later script of the same kind was stopped before it ran.
+- **Lesson.** The meaning of "dry run" must be defined explicitly, and tests should confirm that it has no side effects, for example by checking target paths before and after the run.
 
-- **现象**：开启 `enable_thinking` 后，8 道题里有 7 道在 16384 token 的上限内**只思考、不作答**，思考内容长达 6.3–6.7 万字符，`content` 为 null。把上限提到 49152 补测考题 1，13 分钟、13 万字符后仍然没有答案。
-- **诊断**：
-  1. 先排除"预算不够"：上限提高 3 倍仍然没有输出，说明不是预算问题，而是思考停不下来。
-  2. 对照：同样开启思考，"打印日期"这种简单题 19 秒就能完成。说明问题出在"长系统提示 + 复杂需求"这种组合上。
-  3. 查源码：Strata 自带的聊天模板 `chat_template.jinja:59` 写的是 `reasoning_effort|default('xhigh')`。也就是说，只开 `enable_thinking`、不指定档位时，**默认就是最高档 xhigh**。
-  4. 查社区经验：有帖子指出 Qwen3.8 的 xhigh 档有死循环风险，失败率约 6%，建议 agent 场景用 medium 或 low；各档位的区别只是往系统提示里注入不同的话，并没有 token 预算的差异。
-- **对照实验**：改用 `reasoning_effort=low`，并按社区建议加上"最多约 30 词"的数字化约束。每题耗时降到 8–32 秒，不再循环，但 3 道难题的得分（1/6）和关闭思考时完全一样。
-- **根因**：xhigh 档的提示要求"仔细思考、验证假设、考虑替代方案"，模型面对复杂需求时陷入了反复验证。而对这个模型来说，low 档的思考量又不足以弥补它在 API 知识上的缺口。
-- **经验**：
-  1. 开启思考前，先确认引擎模板的默认档位。
-  2. 用于自动化流水线时，一定要设 `max_tokens` 上限和请求超时，并把"思考被截断"作为一种单独的退出状态（我们用退出码 3）报出来。
-  3. 在单流引擎上，一个陷入循环的请求会把服务独占几分钟，必须配合忙闲感知和超时一起用。
+### 5.11 Non-terminating reasoning
+
+- **Symptom.** With `enable_thinking` set, seven of eight items used the whole 16,384-token budget on reasoning and **produced no answer**. The reasoning traces ran to 63,000–67,000 characters, and `content` was null. Raising the budget to 49,152 tokens for item 1 still gave nothing after 13 minutes and about 132,000 characters.
+- **Diagnosis.**
+  1. *Insufficient budget?* No. Tripling the budget gave no answer, so the reasoning was failing to stop rather than running short.
+  2. *Contrast case.* A trivial prompt (print the date) finished in 19 seconds with reasoning enabled. The fault therefore appeared only when a long system prompt met a complex task.
+  3. *Source inspection.* Strata's chat template (`serve/chat_template.jinja:59`) contains `reasoning_effort|default('xhigh')`. Setting `enable_thinking` without naming an effort level therefore selects the **highest** level.
+  4. *Community evidence.* Reports on Qwen3.8 note that `xhigh` loops in about 6% of cases and recommend medium or low effort for agentic use. The levels differ only in the text injected into the system prompt; they do not set different token budgets.
+- **Controlled comparison.** We then used `reasoning_effort=low` together with a numerical cap ("think in at most about 30 words"), as the community recommends. Each item took 8–32 seconds and nothing looped. The score on the three hardest items, however, matched the reasoning-disabled baseline (1/6).
+- **Root cause.** The `xhigh` instruction asks the model to verify its assumptions and consider alternatives, and on complex specifications the model fell into repeated verification. Low effort, conversely, is not enough to make up for the model's gaps in API knowledge.
+- **Lessons.**
+  1. Before enabling reasoning, check the template's default effort level.
+  2. In automated pipelines, always set `max_tokens` and a request timeout, and report a truncated reasoning trace as a distinct outcome; we use exit code 3.
+  3. On a single-stream engine, one looping request blocks every other client for minutes. Reasoning must therefore be combined with busy-aware queueing and time limits.
 
 ---
 
-## 6 能力评测
+## 6 Capability Evaluation
 
-### 6.1 方法
+### 6.1 Method
 
-- **题目**：10 道运维脚本题。PC 端 8 道 PowerShell 7：磁盘健康、端口占用、大目录统计、robocopy 增量备份、缓存统计、计划任务列表、GPU 监控、服务健康检查。Mac 端 2 道 bash：找出长期没打开的大文件、LaunchAgent 在线检测。另外补了 3 道新题，用来检验泛化能力：自动启动但没运行的服务、最大的 20 个文件、待重启状态与更新历史。
-- **流程**：生成（每题一次，temperature 0.2）→ 提取代码块 → 静态检查（PSScriptAnalyzer / shellcheck）→ 危险操作检查 → 总指挥审查 → 用指定参数在沙盒里运行 → 按事先写好的验收标准检查。验收标准是可以测量的事实，比如“C:\AI 的统计值与真实递归大小相差不超过 5%”、“npm 缓存约 13.4 GB”。
-- **评分**：首次运行就通过得 2 分；按评分规则修复一轮后通过得 1 分；否则 0 分。修复提示只给**一个**具体问题：一行原样的报错，或者一条具体事实。
-- **口径**：严格口径把静态检查警告也算作一次报错；宽松口径只看能不能跑通。正文默认用宽松口径。
+- **Items.** The examination had ten maintenance tasks.
+  - Eight in PowerShell 7 on the desktop: disk health, port ownership, large directories, incremental robocopy backup, cache accounting, scheduled tasks, GPU sampling and a service health check.
+  - Two in bash on the laptop: stale large files and a LaunchAgent that checks availability.
+  - A further three new PowerShell items, written after the first round, tested generalisation: stopped automatic services, the 20 largest files, and reboot status with update history.
+- **Protocol.** For each item:
+  1. one generation at temperature 0.2;
+  2. extraction of the fenced code;
+  3. static analysis (PSScriptAnalyzer or shellcheck);
+  4. a danger screen;
+  5. review by the orchestrator;
+  6. a sandboxed run with fixed arguments;
+  7. comparison against measurable acceptance facts set in advance. One example is that the reported size of `C:\AI` must lie within 5% of its true recursive size; another is that the npm cache must be reported as about 13.4 GB.
+- **Scoring.**
+  - 2 points if the first run passes.
+  - 1 point if the script passes after a single repair round. The repair prompt names **exactly one** concrete problem: a verbatim error line or a single factual discrepancy.
+  - 0 otherwise.
+- **Lenient and strict scoring.** Strict scoring also counts static-analysis warnings as a failure. Figures are lenient unless stated otherwise.
 
-### 6.2 结果
+### 6.2 Results
 
-| 配置 | PC 8 题 | 新题 3 道 | Mac 2 题 | 每题生成耗时 |
+| Configuration | Desktop items (8) | New items (3) | Laptop items (2) | Generation time per item |
 | --- | --- | --- | --- | --- |
-| 关闭思考 | 9/16（严格口径 5/16） | — | 2/4 | 8–48 s |
-| 关闭思考 + PowerShell 陷阱清单 | 9/16 | 3/6 | — | 8–25 s |
-| reasoning_effort = low（只测 3 道难题） | 1/6（关闭思考时同样 3 道也是 1/6） | — | — | 8–32 s |
-| 开启思考（默认 xhigh） | **0/16** | — | — | 4–13 min，不出答案 |
+| Reasoning disabled | 9/16 (strict: 5/16) | — | 2/4 | 8–48 s |
+| Disabled, with PowerShell pitfall checklist | 9/16 | 3/6 | — | 8–25 s |
+| `reasoning_effort = low` (three hardest items) | 1/6 (disabled baseline: 1/6) | — | — | 8–32 s |
+| Reasoning enabled (default `xhigh`) | **0/16** | — | — | 4–13 min, no answer |
 
-**总分（关闭思考的最好成绩）：PC 9/16 + Mac 2/4 = 11/20，没有达到 14 分的通过线。**
+**Best overall score: 9/16 + 2/4 = 11/20, below the pass mark of 14.**
 
-关闭思考时各题的情况：
+Per-item outcomes with reasoning disabled:
 
-| 题目 | 结果 | 首次运行的错误 |
+| Item | Score | Defect in the first attempt |
 | --- | --- | --- |
-| 1 磁盘健康 | 2 | 无（温度和磨损显示 N/A，原因是读取需要管理员权限，属于环境限制） |
-| 2 端口占用 | 1 | 字符串插值 `"$procId: ..."` 被解析成作用域变量，导致语法错误 |
-| 3 大目录统计 | 0 | 只累加到 2 层深度：`C:\AI` 统计成 1.08 GB，实际是 80.22 GB；修复后仍然不对 |
-| 4 robocopy 备份 | 0 | `/LOG+` 和路径被拆成两个参数，robocopy 返回 exit 16；`/XF` 写了带路径的匹配 |
-| 5 缓存统计 | 1 | 检测函数写成 `return $null -ne $null`，永远返回 false，漏掉了 15.2 GB 的缓存 |
-| 6 计划任务 | 1 | 在 StrictMode 下读取了不存在的 `NextRunTime` 属性 |
-| 7 GPU 监控 | 2 | 无 |
-| 8 健康检查 | 2 | 无 |
-| 9 (Mac) 长期没打开的大文件 | 2 | 无 |
-| 10 (Mac) LaunchAgent | 0 | 危险操作检查命中 `rm -f`；没有生成 plist，URL 写死在脚本里 |
+| 1 Disk health | 2 | none (temperature and wear reported N/A because they require elevation, an environmental limit) |
+| 2 Port ownership | 1 | `"$procId: …"` parsed as a scope-qualified variable, giving a parse error |
+| 3 Large directories | 0 | sizes summed only to depth 2; `C:\AI` reported as 1.08 GB against a true 80.22 GB; not fixed by the repair |
+| 4 Robocopy backup | 0 | `/LOG+` split from its path (robocopy exit 16); `/XF` given a path pattern |
+| 5 Cache accounting | 1 | detection function returned `$null -ne $null`, always false, so 15.2 GB of caches was missed |
+| 6 Scheduled tasks | 1 | read the non-existent `NextRunTime` property under StrictMode |
+| 7 GPU sampling | 2 | none |
+| 8 Health check | 2 | none |
+| 9 (laptop) Stale large files | 2 | none |
+| 10 (laptop) LaunchAgent | 0 | danger screen matched `rm -f`; no plist produced; URL hard-coded |
 
-### 6.3 错误分类
+### 6.3 Classification of errors
 
-| 类别 | 例子 | 陷阱清单能否解决 |
+| Class | Examples | Can a checklist help? |
 | --- | --- | --- |
-| 语言细节 | `$var:` 插值、标量拆包、StrictMode 下读属性 | 部分能（第 1 条被遵守了，第 8 条写得明明白白却仍被违反） |
-| API 或命令记错 | `npm cache dir` 不存在、`Win32_Service` 没有 `StartType`、robocopy 参数格式 | 只能逐条补，不能泛化 |
-| 需求理解偏差 | “深度”参数被理解成统计深度而不是报告深度；dry-run 有副作用 | 部分能 |
-| 完整性缺失 | 考题 10 漏掉 plist 和 bootstrap 命令 | 不能 |
+| Language detail | `$var:` interpolation; scalar unwrapping; property access under StrictMode | Partly. Rule 1 was obeyed, but rule 8 was broken although it was stated explicitly |
+| Wrong API or CLI fact | `npm cache dir` does not exist; `Win32_Service` has no `StartType`; robocopy argument syntax | Only one fact at a time; it does not generalise |
+| Misread specification | the depth parameter used to limit the size sum; side effects in a dry run | Partly |
+| Incomplete deliverable | item 10 had no plist and no bootstrap command | No |
 
-### 6.4 讨论
+### 6.4 Discussion
 
-1. **能力上限，而不是提示词问题。** 四种配置的分数基本持平，或者更差。清单里写到的坑，模型大多避开了，但它会在清单外的 API 细节上出错。这和社区的判断一致：问题出在模型本身的能力上限，靠思考档位补不齐，应该按任务难度把任务分给本地模型或云端模型。
-2. **只读、单一步骤的任务表现最好。** 一次就跑通的题（1、7、8、9、新题 2）都是只读或单一步骤的。涉及外部工具参数格式（robocopy）、多层逻辑（目录统计）和完整交付物（LaunchAgent）的任务，失败率高。
-3. **修复对“一个具体报错”有效，对“结果不对”无效。** 题 2、5、6、7 拿到具体报错后修好了；题 3、4 拿到“数值不对”这类事实描述后，模型只改了表面，逻辑问题没修好。这和社区帖 #2017 的观察一致。
-4. **安全闸门是必要的。** 两次危险情况（dry-run 时建目录、`rm -f`）都在运行前被拦下，或者事后被测试发现。
+1. **A capability ceiling, not a prompting problem.** All four configurations scored about the same, or worse. The model mostly avoided the pitfalls that the checklist named, but it then erred on API facts that the checklist did not cover. This agrees with community observations that reasoning effort cannot make up for limits in the model itself, and that tasks should be routed by difficulty between local and hosted models.
+2. **Read-only, single-step tasks fare best.** Every item that passed at the first attempt was read-only or single-step (items 1, 7, 8 and 9, and new item 2). Failure was concentrated in tasks that depend on external tool syntax (robocopy), multi-level logic (directory sizing) or a complete set of deliverables (the LaunchAgent).
+3. **Repair works for a concrete error, not for a wrong result.** Items 2, 5, 6 and 7 were fixed when the model was given a verbatim error. Items 3 and 4 were not: told only that a result was wrong, the model made superficial changes and left the faulty logic in place. This matches the community observation recorded in §2.3.
+4. **The safety gates are necessary.** Both hazardous outputs — the directory created during a dry run and the `rm -f` — were caught: one by testing after the fact, the other before it ran.
 
-### 6.5 有效性威胁
+### 6.5 Threats to validity
 
-- 样本小：每题只生成一次，temperature 0.2 下仍然有随机性，没有做多次采样取平均。
-- 评分和验收标准由同一方制定。我们尽量把它们写成可以测量的事实，但题目难度的分布仍然是主观选择的。
-- 陷阱清单是在看过错误之后写的，对原题有"背答案"的嫌疑，所以加了 3 道新题来检验，但新题只有 3 道。
-- 只测了 IQ3_XXS 这一个量化档。IQ2_XS 预计更差，IQ3_S 在 64 GB 内存上放不下，都没有实测。
+- **Small samples.** Each item was generated once, and output at temperature 0.2 still varies from run to run. No repeated sampling was done.
+- **Self-set criteria.** The same party wrote the items and the acceptance criteria. The criteria were framed as measurable facts, but the difficulty mix remains a subjective choice.
+- **Possible overfitting.** The pitfall checklist was written after the failures had been seen, so it may be tuned to the original items. The three new items were added to test generalisation, but three is a small number.
+- **A single quantisation tier.** Only IQ3_XXS was evaluated. IQ2_XS would probably score lower, and IQ3_S does not fit in 64 GB.
 
 ---
 
-## 7 运维设计
+## 7 Operational Design
 
-### 7.1 单流引擎的工程约束
+### 7.1 Engineering for a single-stream engine
 
-我们实测了 `/status` 接口在服务空闲和生成两种状态下的表现：
+We measured the `/status` endpoint while the server was idle and while it was generating.
 
-- `busy` 字段可靠：生成期间每次采样都是 true，空闲时为 false。
-- 空闲时，`phase`、`generated` 等字段保留的是上一次请求的值，**只能信 `busy`**。
-- 生成期间，`/health` 和 `/v1/models` 仍然在 1–2 ms 内返回。所以“健康检查超时”不能当作“服务忙”的信号，健康检查可以放心使用很短的超时时间。
+- The `busy` flag was reliable: true in every sample taken during generation and false when idle.
+- When idle, `phase`, `generated` and the other fields still hold the values from the previous request, **so only `busy` should be trusted**.
+- During generation, `/health` and `/v1/models` still answered within 1–2 ms. A slow health check is therefore not evidence that the server is busy, and health checks can safely use short timeouts.
 
-据此设计了两件事：
+Two measures follow from this.
 
-- **`askl` 排队**：发请求前先查 `busy`，在忙就每 5 秒查一次，最多等 600 秒；超时返回退出码 4。这样把多个调用方的并发请求变成了客户端侧的串行排队。
-- **退出码约定**：0 成功；1 一般错误；2 服务离线；3 思考被截断；4 排队超时。
+- **Client-side queueing in `askl`.** Before sending, `askl` checks `busy`. If the server is busy, it re-checks every 5 seconds for up to 600 seconds, then gives up with exit code 4. This turns concurrent callers into serial queueing on the client side.
+- **Exit-code convention.**
 
-### 7.2 健康检查的状态机
+| Exit code | Meaning |
+| --- | --- |
+| 0 | success |
+| 1 | general error |
+| 2 | server offline |
+| 3 | reasoning truncated |
+| 4 | queue timeout |
+
+### 7.2 Health-check state machine
 
 ```
-           ┌──────────── /health 连不上 / 超时 / 非 200 ────────────┐
-           │                                                       ▼
-/health ──▶ 200 且 loaded=true ──▶ /status busy? ──是──▶ 记录 busy，退出 0（绝不重启）
-           │                          └──否──▶ 记录 healthy，退出 0
-           └─ 200 且 loaded=false ─▶ 加载已持续多久？
-                                        < 15 分钟 ─▶ 记录 loading，退出 0
-                                        ≥ 15 分钟 ─▶ 视为不健康
-不健康 ─▶ 重试 3 次，每次间隔 20 秒 ─▶ 仍不健康 ─▶ Strata-Server 启动不到 5 分钟？
-                                                   是 ─▶ 记录 startup grace，退出 0
-                                                   否 ─▶ 重启计划任务（在 ShouldProcess 内）
+            ┌──────── /health unreachable / timeout / non-200 ────────┐
+            │                                                          ▼
+/health ──▶ 200 and loaded=true ──▶ /status busy? ──yes──▶ log "busy", exit 0 (never restart)
+            │                          └──no──▶ log "healthy", exit 0
+            └─ 200 and loaded=false ─▶ loading for how long?
+                                         < 15 min ─▶ log "loading", exit 0
+                                         ≥ 15 min ─▶ treat as unhealthy
+unhealthy ─▶ 3 retries, 20 s apart ─▶ still unhealthy ─▶ Strata-Server started < 5 min ago?
+                                                         yes ─▶ log "startup grace", exit 0
+                                                         no  ─▶ restart the task (inside ShouldProcess)
 ```
 
-设计要点：
-1. **服务在忙时绝不重启**，否则会打断正在跑的长任务。
-2. **加载中有宽限期**：开机后模型要加载 1–2 分钟。如果把 `loaded=false` 当成故障，就会在加载过程中重启服务，导致服务永远起不来。
-3. **启动宽限期**：计划任务刚启动的 5 分钟内不重启，和自愈循环（30 秒后自动重启进程）互不干扰。
-4. **不用"日志一段时间没输出"判断故障**：社区经验表明，这样会导致无限重启。
-5. 用 `-WhatIf:$false` 写日志，保证预演时也有记录；日志里不写 key。
+Design principles:
 
-这些分支都用模拟的 HTTP 服务（`HttpListener` 在后台线程里返回 `loaded:false`）做了测试，15/15 通过。
+1. **Never restart a busy server.** A restart would kill a long-running job.
+2. **Allow a grace period while the model loads.** The model takes one to two minutes to load after logon. Treating `loaded=false` as a fault would restart the server mid-load, again and again, so it would never come up.
+3. **Allow a grace period after start-up.** No restart is made within five minutes of the task starting, so the supervisor and the launcher's own respawn loop do not interfere with each other.
+4. **Never treat a quiet log as a failure signal.** The community has reported endless restart cycles caused by doing so.
+5. **Log correctly.** Log lines are written with `-WhatIf:$false`, so they appear even during previews, and the key is never written to the log.
+
+Each branch was tested against a mock HTTP server: an `HttpListener` on a background thread that serves `loaded:false`. The suite passed (15/15).
 
 ---
 
-## 8 最终定位："初稿生成器 + 四道闸门"
+## 8 Final Role: A First-Draft Generator Behind Four Gates
 
-根据第 6 节的数据，我们放弃了“本地模型独立完成脚本任务”的设想，改为：
+On the evidence of §6, we abandoned the premise that the local model could complete scripting tasks on its own. We adopted the following arrangement instead:
 
-| 闸门 | 工具 | 拦住什么 |
+| Gate | Instrument | Intercepts |
 | --- | --- | --- |
-| 1 静态检查 | PSScriptAnalyzer（Warning 及以上）/ shellcheck（`-S warning`） | 语法错误、未使用的变量、`Write-Host` 等 |
-| 2 危险操作检查 | grep：`Remove-Item`、`rm`、`/MIR`、`/PURGE`、注册表写入、`Stop-Process`、缓存清理，以及不在正式运行分支里的写盘操作 | 删除、破坏性操作、dry-run 有副作用 |
-| 3 强模型审查 | Claude 通读脚本 | 逻辑错误、需求理解偏差、API 用错 |
-| 4 沙盒试跑 | 只读脚本直接运行；有写操作的只跑 `-WhatIf` 或 `/L`，正式运行要用户批准 | 运行期错误、结果不对 |
+| 1 Static analysis | PSScriptAnalyzer (Warning and above); shellcheck (`-S warning`) | syntax errors, unused variables, `Write-Host` |
+| 2 Danger screen | pattern search for `Remove-Item`/`rm`, `/MIR`, `/PURGE`, registry writes, `Stop-Process`, cache purges, and writes outside the real-run branch | destructive operations; side effects in dry runs |
+| 3 Strong-model review | the orchestrator reads the whole script | logic errors, incorrect APIs, misread specifications |
+| 4 Sandboxed execution | read-only scripts run directly; writing scripts run only with `-WhatIf` or `/L` until the owner approves | run-time errors, incorrect results |
 
-使用规则：
-- 修复一次只给一个具体问题，最多修一轮；还不对，就交给强模型直接重写。
-- 通过四道闸门的脚本收进脚本库，用 git 管理，以后直接复用，不再重新生成。
-- 本地模型最适合的任务：**只读的巡检、统计、监控类脚本**。
+**Operating rules.**
 
----
-
-## 9 后续调整方案
-
-### 9.1 短期（1–2 周）
-
-1. **速度调优**（社区帖 #2095 在 3080 Ti 12G 上的数据）：
-   - 依次单独测试 `--pcie-frac`（他的最佳值是 0.34，效果曲线呈倒 U 形）、`--spec-min-p 0.70`（我们现在是 0.5）、CPU 工作线程数（5600X 只有 6 核，不能照搬他的 9）。
-   - 每次只改一个参数，用固定的一组 prompt 测速。
-2. **补充陷阱清单**：把评测中暴露出来的 API 记错加进去，比如 `npm config get cache`、`Win32_Service` 用的是 `StartMode`、目录统计时要区分报告深度和统计深度。然后**用新题验证**，不要用原题。
-3. **扩大评测样本**：每题生成 3 次取平均，评估温度对首次通过率的影响。
-4. **Mac 端 LaunchAgent**：由强模型写好考题 10，用户确认后安装，PC 离线时在 Mac 上弹通知。
-5. **小修复**：健康检查注册脚本在比对用户名时忽略域名前缀（现在每次重复运行都会重新注册一遍，结果相同，没有副作用）。
-
-### 9.2 中期（1–2 个月）
-
-1. **对比 Coder 变体**：Strata 安装程序有 `--family coder` 选项（Flash-Next Coder，只有 IQ1_M 量化，58.4 GB）。用同一套题对比。IQ1 精度很低，结果难以预判，但代码专用的微调可能对 API 记忆有帮助。
-2. **试 medium 思考档 + 服务端思考预算**：这次只测了 xhigh 和 low。如果 Strata 以后支持服务端的思考 token 上限（类似 SGLang 的 `SGLANG_MAX_THINK_TOKENS`），可以用来防止死循环。
-3. **加一个检索层**：把 PowerShell 和 bash 官方文档里常用 cmdlet 的签名做成检索库，生成前先检索相关 API，用来对付“API 记错”这一类主要错误。
-4. **跟进版本升级**：Strata 迭代很快。升级前备份配置文件（升级会覆盖），升级后重新跑全套测试和评测，分数下降就回滚。
-
-### 9.3 长期
-
-1. **按难度把任务分给本地或云端**：只读或单一步骤的任务交给本地模型；涉及多个工具、多层逻辑或完整交付物的任务直接交给强模型。分流规则可以根据脚本库里积累的通过率数据来调整。
-2. **硬件**：如果要让本地模型承担更多任务，最划算的升级是**内存加到 96 GB 以上**。这样能脱离 low-RAM 档，放得下 IQ3_S，内存也有余量。显卡的影响相对小，因为 Strata 的瓶颈在内存带宽和 PCIe 带宽。
-3. **可观测性**：把 `/status` 和 `/metrics` 接入监控面板，记录每天的请求数、平均排队时间和专家缓存命中率。
+- A repair names one concrete problem and is allowed one round only. If the script still fails, the strong model rewrites it.
+- Scripts that pass all four gates go into a version-controlled library and are reused rather than regenerated.
+- The tasks that suit the local model best are **read-only inspection, reporting and monitoring**.
 
 ---
 
-## 10 结论
+## 9 Further Work
 
-部署工程本身是成功的：12 GB 显卡加 64 GB 内存的普通台式机，可以稳定地以 50 tok/s 以上的速度提供 176B MoE 模型的局域网服务，并实现开机自启、鉴权、健康检查和自愈。
+### 9.1 Short term (one to two weeks)
 
-“测试驱动 + 总指挥/子代理”的方法在这个项目里证明了价值：
-- 它在部署过程中发现了 11 类问题。显存不足和思考循环这两个问题很隐蔽，靠测试和日志才发现；“只跑了预演却以为执行了”和“测试本身有 bug”这类问题，如果没有测试几乎不可能被注意到。
+1. **Throughput tuning.** A community report on an RTX 3080 Ti (12 GB) found three settings that matter:
+   - `--pcie-frac`, with an optimum at 0.34 on an inverted-U curve;
+   - `--spec-min-p 0.70`, against 0.5 here;
+   - the number of CPU workers. The 5600X has only six cores, so that report's value of 9 does not carry over.
 
-但本地模型写运维脚本的能力**没有达到预设标准**：最好成绩 11/20，首次通过率约 50%。思考模式、低强度思考和陷阱清单都没有带来可测量的提升。我们接受这个结论，并据此把它定位为“初稿生成器”，用四道闸门保证最终脚本的质量。
+   Each setting should be tested on its own, against a fixed set of prompts.
+2. **A larger checklist.** Add the API facts exposed by the evaluation, for example `npm config get cache`, `Win32_Service.StartMode`, and the difference between reporting depth and summation depth. Then validate on **new** items, not the original ones.
+3. **Larger samples.** Generate each item three times and estimate how temperature affects the first-attempt pass rate.
+4. **A laptop availability monitor.** Have the strong model write item 10 and install it only once the owner approves.
+5. **A minor correction.** The idempotence check in the health-task registration should ignore the domain prefix in the user name. At present every re-run registers the task again; the result is identical, so this is harmless.
 
-我们认为，对其他想做同样事情的人来说，最重要的一条建议是：**先定义可以测量的验收标准，再部署；用实测数据，而不是用期望，来决定模型承担什么角色。**
+### 9.2 Medium term (one to two months)
+
+1. **The Coder variant.** The installer offers `--family coder` (Flash-Next Coder, IQ1_M only, 58.4 GB). The precision is very low, but fine-tuning for code may help with recalling APIs, so the variant should be compared on the same examination.
+2. **Medium effort with a server-side budget.** Only `xhigh` and `low` were tested. If Strata gains a server-side cap on reasoning tokens, comparable to SGLang's `SGLANG_MAX_THINK_TOKENS`, that cap would prevent loops.
+3. **Retrieval.** An index of cmdlet and CLI signatures from official documentation, retrieved before each generation, would target the most common class of error: wrong API facts.
+4. **Upgrade discipline.** Strata changes quickly. Back up the configuration before each upgrade, because upgrades overwrite it. Afterwards, re-run every acceptance suite and the examination, and roll back if any score falls.
+
+### 9.3 Long term
+
+1. **Routing by difficulty.** Send read-only and single-step tasks to the local model, and send work that spans several tools, needs multi-level logic or has several deliverables directly to a strong model. The routing rules can be tuned from the pass rates recorded in the script library.
+2. **Hardware.** The most cost-effective upgrade is **96 GB or more of system memory**. That would leave the low-RAM tier, allow IQ3_S and restore headroom. With this engine the bottleneck is memory and PCIe bandwidth rather than the GPU itself, so a larger GPU would help less.
+3. **Observability.** Feed `/status` and `/metrics` into a dashboard that records daily request counts, mean queueing time and the expert-cache hit rate.
 
 ---
 
-## 附录 A：关键配置
+## 10 Conclusion
+
+The engineering objective was met. A desktop with a 12 GB GPU and 64 GB of system memory can serve a 176B MoE model to the local network reliably at more than 50 tokens per second, with automatic start-up, authentication, health supervision and self-healing.
+
+Test-driven, orchestrated execution proved its worth. It exposed eleven classes of problem. Two of them, graphics-memory exhaustion and reasoning loops, were subtle and surfaced only through tests and log analysis. Others, such as a preview mistaken for execution or defects in the tests themselves, would very probably have gone unnoticed without tests.
+
+The model's ability to write scripts, however, did not meet the threshold set in advance. Its best score was 11/20, and its first-attempt pass rate was about 50%. Neither reasoning modes nor a domain checklist gave a measurable gain. We accept this result and have redefined the model's role as a first-draft generator whose output is controlled by four quality gates.
+
+For anyone attempting a similar deployment, our principal recommendation is this: **define measurable acceptance criteria before deploying, and let measurement rather than expectation decide what role the model plays.**
+
+---
+
+## Appendix A: Key Configuration
 
 ```jsonc
-// strata-swift-iq3_xxs.json（节选；手动修改的项已标注）
+// strata-swift-iq3_xxs.json (excerpt; manual edits marked)
 {
-  "host": "0.0.0.0",                 // 手动修改
+  "host": "0.0.0.0",                 // manual
   "port": 8080,
-  "api_key": "<REDACTED>",           // 手动修改
-  "model_name": "local-flash-next",  // 手动修改
+  "api_key": "<REDACTED>",           // manual
+  "model_name": "local-flash-next",  // manual
   "args": [
     "--expert-cache", "auto", "--prefill", "auto",
     "--spec", "4", "--spec-min-p", "0.5",
     "--max-context", "131072",
-    "--mtp-window", "65536",         // 手动添加；重新运行 setup 会丢失
+    "--mtp-window", "65536",         // manual; lost if setup is re-run
     "--kv", "int8", "--kv-resident", "32768",
-    "--vram-reserve-mib", "3072"     // 由 1500 改成 3072，解决 cuBLAS 初始化失败
+    "--vram-reserve-mib", "3072"     // raised from 1500 to resolve the cuBLAS failure
   ]
 }
 ```
 
-## 附录 B：给复现者的检查清单
+## Appendix B: Reproduction Checklist
 
-1. 用 `Get-PhysicalDisk` 核对安装盘是 NVMe，不要装在机械盘上。
-2. 克隆仓库后，**先审计源码**，以源码里的参数名为准，不要照搬社区帖里的命令。
-3. 先用你想要的 Python 版本手动创建 venv。
-4. 12 GB 显卡同时驱动桌面时，`--vram-reserve-mib` 至少设 3072。
-5. 64 GB 内存跑 IQ3_XXS，启动前要保证空闲内存 ≥ 48 GB。
-6. 思考模式默认是 xhigh。用于自动化时，要么关掉，要么显式指定档位，并设上限和超时。
-7. 单流引擎：调用方先查 `/status` 的 `busy` 字段再发请求；健康检查在服务忙或加载中时绝不重启。
-8. 升级前备份配置文件、`run-*.bat` 和 `serve/server.py`，因为升级会覆盖它们。
-9. 本地模型生成的脚本一律先经过四道闸门，再决定是否执行。
+1. Install on NVMe storage, and confirm the drive with `Get-PhysicalDisk`.
+2. Audit the installer source after cloning, and prefer its flag names to those in forum posts.
+3. Create the virtual environment yourself with the Python version you intend to use.
+4. On a 12 GB GPU that also drives a display, set `--vram-reserve-mib` to at least 3072.
+5. With 64 GB of memory and IQ3_XXS, make sure at least 48 GB is free before starting.
+6. Reasoning defaults to `xhigh`. For automation, either disable it or name an effort level explicitly, with a token cap and a timeout.
+7. On a single-stream engine, clients should check `/status` `busy` first, and the health check must never restart a server that is busy or still loading.
+8. Back up the configuration, `run-*.bat` and `serve/server.py` before upgrading; upgrades overwrite them.
+9. Pass every script generated by the model through all four gates before deciding whether to run it.
 
-## 附录 C：测试清单
+## Appendix C: Acceptance Suites
 
-| 测试 | 项数 | 结果 |
+| Suite | Assertions | Result |
 | --- | --- | --- |
-| Stage0 预检 | 8 | 8/8 |
-| Stage0b 工具安装 | 6 | 6/6 |
-| Stage1a 克隆与审计 | 5 | 5/5 |
-| Stage1b 安装 | 21 | 20/20 + 1 项无法判定 |
-| Stage1c 首次启动 | 6 | 6/6 |
-| Stage2 局域网与自启 | 19 | 19/19 |
-| StageReboot 重启验证 | 10 | 10/10 |
-| Stage4a askl 工具 | 12 | 12/12 |
-| Stage4b/4c 忙闲感知与健康检查 | 15 | 15/15 |
-| StageHealthTask 定时任务 | 9 | 9/9 |
-| Mac stage3.bats | 10 | 10/10 |
+| Stage 0 pre-flight | 8 | 8/8 |
+| Stage 0b toolchain | 6 | 6/6 |
+| Stage 1a clone and audit | 5 | 5/5 |
+| Stage 1b installation | 21 | 20/20 + 1 inconclusive |
+| Stage 1c first start | 6 | 6/6 |
+| Stage 2 network and start-up | 19 | 19/19 |
+| Reboot verification | 10 | 10/10 |
+| Stage 4a `askl` client | 12 | 12/12 |
+| Stage 4b/4c busy-awareness and health check | 15 | 15/15 |
+| Health-check scheduled task | 9 | 9/9 |
+| Laptop `stage3.bats` | 10 | 10/10 |
 
-## 参考
+## References
 
-- Strata 仓库：https://github.com/Niko1221/Strata
-- 社区讨论（lcz.me）：#1987、#1988、#2002、#2017、#2031、#2032、#2035（Strata 部署与参数），#1181、#1173、#1226（Qwen3.8 思考档位），#1711（单卡排队），#2095（3080 Ti 12G 调参），#433（agent 误删数据事故）
+- Strata repository: <https://github.com/Niko1221/Strata>
+- Community discussions on lcz.me:
+  - Strata deployment and parameters: threads #1987, #1988, #2002, #2017, #2031, #2032, #2035
+  - Qwen3.8 reasoning-effort levels: #1173, #1181, #1226
+  - single-GPU request queueing: #1711
+  - RTX 3080 Ti 12 GB tuning: #2095
+  - an agent data-loss incident and the resulting safe-deletion rules: #433
