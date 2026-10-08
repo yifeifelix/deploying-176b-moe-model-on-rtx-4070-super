@@ -1,4 +1,4 @@
-# Deploying a 176B Mixture-of-Experts Model on a 12 GB Consumer GPU as a Maintenance-Script Sub-Agent: A Test-Driven Field Study
+# Deploying a 176B MoE Model on an RTX 4070 SUPER: A Test-Driven Field Study of a Local Maintenance-Script Sub-Agent
 
 **Author:** yifeifelix (deployment, operation and decisions), using Claude Opus 5.5 acting as orchestrator and reviewer; execution was delegated to sub-agents.
 **Period of study:** 7–8 October 2026
