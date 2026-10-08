@@ -1,6 +1,6 @@
 # Deploying a 176B Mixture-of-Experts Model on a 12 GB Consumer GPU as a Maintenance-Script Sub-Agent: A Test-Driven Field Study
 
-**Author:** yifeifelix (deployment, operation and decisions), with Claude acting as orchestrator and reviewer; execution was delegated to sub-agents.
+**Author:** yifeifelix (deployment, operation and decisions), using Claude Opus 5.5 acting as orchestrator and reviewer; execution was delegated to sub-agents.
 **Period of study:** 7–8 October 2026
 **Platform:** NVIDIA RTX 4070 SUPER (12 GB), AMD Ryzen 5 5600X, 64 GB DDR4, Windows 11
 **Software:** Strata v0.1.40.3; Swift-1.5 Qwen3.8-Flash-Next, IQ3_XXS quantisation
@@ -594,9 +594,3 @@ For anyone attempting a similar deployment, our principal recommendation is this
 ## References
 
 - Strata repository: <https://github.com/Niko1221/Strata>
-- Community discussions on lcz.me:
-  - Strata deployment and parameters: threads #1987, #1988, #2002, #2017, #2031, #2032, #2035
-  - Qwen3.8 reasoning-effort levels: #1173, #1181, #1226
-  - single-GPU request queueing: #1711
-  - RTX 3080 Ti 12 GB tuning: #2095
-  - an agent data-loss incident and the resulting safe-deletion rules: #433
